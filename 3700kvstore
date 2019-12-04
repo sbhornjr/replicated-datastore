@@ -18,22 +18,22 @@ replica_ids = sys.argv[2:]
 sock = socket.socket(socket.AF_UNIX, socket.SOCK_SEQPACKET)
 sock.connect(my_id)
 
-currentTerm = 1                       # the current term
-votedFor = ''                         # who I voted for this election
+current_term = 1                       # the current term
+voted_for = ''                         # who I voted for this election
 log = []                              # my log of commands for state machine
 database = []                         # the state machine
-commitIndex = 0                       # index of highest log entry known to be committed
-lastApplied = 0                       # index of highest log entry applied to state machine
-nextIndex = {}                        # for leader; next index to send to each follower
-matchIndex = {}                       # for leader; index of highest log entry known to be replicated there
+commit_index = 0                       # index of highest log entry known to be committed
+last_applied = 0                       # index of highest log entry applied to state machine
+next_index = {}                        # for leader; next index to send to each follower
+match_index = {}                       # for leader; index of highest log entry known to be replicated there
 
 status = 'follower'                   # current status
 leaderID = ''                         # ID of known leader
-lastReceivedFromLeader = time.time()  # the time when I last received a message from the leader
-lastSentToFollowers = ''              # the time when I last sent a message to my followers
-votesGranted = {}                     # candidates use; who voted/didn't vote for me
-lastLogIndex = 0                      # index of my last log entry
-lastLogTerm = 0                       # term of my last log entry
+last_received_from_leader = time.time()  # the time when I last received a message from the leader
+last_sent_to_followers = ''              # the time when I last sent a message to my followers
+votes_granted = {}                     # candidates use; who voted/didn't vote for me
+last_log_index = 0                      # index of my last log entry
+last_log_term = 0                       # term of my last log entry
 num_servers = len(replica_ids) + 1    # number of servers (including me)
 
 
@@ -44,34 +44,34 @@ def sock_send(message):
 
 # initiate leader election
 def initiate_election():
-  global currentTerm
+  global current_term
   global leaderID
   global status
-  global votedFor
-  global votesGranted
-  global lastReceivedFromLeader
+  global voted_for
+  global votes_granted
+  global last_received_from_leader
 
   # increment term, change leader id to unknown, i am now a candidate, vote for myself, send to other servers
-  currentTerm += 1
+  current_term += 1
   leaderID = 'FFFF'
   status = 'candidate'
-  votedFor = my_id
-  votesGranted[my_id] = True
-  lastReceivedFromLeader = time.time()
+  voted_for = my_id
+  votes_granted[my_id] = True
+  last_received_from_leader = time.time()
   for rid in replica_ids:
     vote_msg = {'src': my_id, 'dst': rid, 'leader': leaderID, 'type': 'RequestVote',
-                'term': currentTerm, 'lastLogIndex': lastLogIndex, 'lastLogTerm': lastLogTerm}
+                'term': current_term, 'lastLogIndex': last_log_index, 'lastLogTerm': last_log_term}
     sock.send(json.dumps(vote_msg))
 
 
 # get the number of votes granted to me in election
 def get_num_votes():
-  global votesGranted
+  global votes_granted
 
   num_votes = 0
 
-  for x in votesGranted:
-    if votesGranted[x] is True:
+  for x in votes_granted:
+    if votes_granted[x] is True:
       num_votes += 1
 
   return num_votes
@@ -95,71 +95,73 @@ while True:
 
     # message is from leader
     if msg['src'] == leaderID:
-      lastReceivedFromLeader = time.time()
+      last_received_from_leader = time.time()
 
     # For now, ignore get() and put() from clients
     if msg['type'] in ['get', 'put']:
-      pass
+      if status != 'leader':
+
 
     # someone requested a vote
     elif msg['type'] == 'RequestVote':
       # this is from a previous term; decline
-      if msg['term'] < currentTerm:
+      if msg['term'] < current_term:
         new_msg = {'src': my_id, 'dst': msg['src'], 'leader': leaderID, 'type': 'ResponseVote',
-                   'voteGranted': False, 'term': currentTerm}
+                   'voteGranted': False, 'term': current_term}
 
       # either this is for a higher term, or for this term and i already voted for this server
-      elif msg['term'] > currentTerm or (votedFor == msg['src'] and msg['term'] == currentTerm):
-        currentTerm = msg['term']
-        votedFor = msg['src']
+      elif msg['term'] > current_term or (voted_for == msg['src'] and msg['term'] == current_term):
+        current_term = msg['term']
+        voted_for = msg['src']
         leaderID = 'FFFF'
-        lastReceivedFromLeader = time.time()
+        last_received_from_leader = time.time()
         new_msg = {'src': my_id, 'dst': msg['src'], 'leader': leaderID, 'type': 'ResponseVote',
-                   'voteGranted': True, 'term': currentTerm}
+                   'voteGranted': True, 'term': current_term}
       # in this election, i already voted for someone else
       else:
         new_msg = {'src': my_id, 'dst': msg['src'], 'leader': leaderID, 'type': 'ResponseVote',
-                   'voteGranted': False, 'term': currentTerm}
+                   'voteGranted': False, 'term': current_term}
       sock_send(new_msg)
 
     # candidate use; someone responded to my vote request
     elif msg['type'] == 'ResponseVote':
-      votesGranted[msg['src']] = msg['voteGranted']
+      votes_granted[msg['src']] = msg['voteGranted']
       # i have a quorum of votes - i am leader!
       if get_num_votes() >= (num_servers / 2) + 1:
         election_timeout = None
         status = 'leader'
         leaderID = my_id
-        lastSentToFollowers = time.time()
+        last_sent_to_followers = time.time()
         for rid in replica_ids:
+          next_index
           new_msg = {'src': my_id, 'dst': rid, 'leader': leaderID,
-                      'type': 'Heartbeat', 'term': currentTerm}
+                      'type': 'Heartbeat', 'term': current_term}
           sock_send(new_msg)
 
     # heartbeat received
     elif msg['type'] == 'Heartbeat':
-      if msg['term'] >= currentTerm:
+      if msg['term'] >= current_term:
         # this is from a new leader, reset election timeout
         if leaderID == 'FFFF':
           election_timeout = random.randrange(100, 200) / float(1000)
 
         # reset the following values
-        lastReceivedFromLeader = time.time()
-        votesGranted = {}
-        votedFor = ''
+        last_received_from_leader = time.time()
+        votes_granted = {}
+        voted_for = ''
         leaderID = msg['leader']
         status = 'follower'
 
   # it's been too long since i've heard from the leader; initiate election
-  if status != 'leader' and time.time() - lastReceivedFromLeader >= election_timeout:
+  if status != 'leader' and time.time() - last_received_from_leader >= election_timeout:
     initiate_election()
 
   # time to send a heartbeat message to my followers
-  elif status == 'leader' and time.time() - lastSentToFollowers >= .1:
-    lastSentToFollowers = time.time()
+  elif status == 'leader' and time.time() - last_sent_to_followers >= .1:
+    last_sent_to_followers = time.time()
     for rid in replica_ids:
       new_msg = {'src': my_id, 'dst': rid, 'leader': leaderID,
-                 'type': 'Heartbeat', 'term': currentTerm}
+                 'type': 'Heartbeat', 'term': current_term}
       sock_send(new_msg)
 
 #import sys
