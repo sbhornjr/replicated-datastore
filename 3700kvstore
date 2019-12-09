@@ -28,7 +28,7 @@ next_index = {}                           # for leader; next index to send to ea
 match_index = {}                          # for leader; index of highest log entry known to be replicated there
 
 status = 'follower'                       # current status
-leaderID = ''                             # ID of known leader
+leaderID = 'FFFF'                         # ID of known leader
 last_received_from_leader = time.time()   # the time when I last received a message from the leader
 last_sent_to_followers = {}               # the times when I last sent a message to my followers
 votes_granted = {}                        # candidates use; who voted/didn't vote for me
@@ -36,17 +36,21 @@ last_log_index = 0                        # index of my last log entry
 last_log_term = 0                         # term of my last log entry
 num_servers = len(replica_ids) + 1        # number of servers (including me)
 leader_responses = {}
+sources = {}
 
 num_messages = {}
+ok_sent = []
 
 
 # send message to sock
 def sock_send(message):
-  #try:
-  #  num_messages[message['type']] += 1
-  #except KeyError:
-  #  num_messages[message['type']] = 1
-  #print message['type'], my_id, 'to', message['dst']
+  global next_index
+  global log
+
+  if status == 'leader':
+    if message['dst'] in replica_ids:
+      last_sent_to_followers[message['dst']] = time.time()
+
   sock.send(json.dumps(message))
 
 
@@ -68,7 +72,7 @@ def initiate_election():
   last_received_from_leader = time.time()
   for rid in replica_ids:
     vote_msg = {'src': my_id, 'dst': rid, 'leader': leaderID, 'type': 'RequestVote',
-                'term': current_term, 'lastLogIndex': last_log_index, 'lastLogTerm': last_log_term}
+                'term': current_term, 'last_log_index': last_log_index, 'last_log_term': last_log_term}
     sock_send(vote_msg)
 
 
@@ -115,48 +119,64 @@ while True:
         #print len(database), len(log)
         if msg['type'] == 'put':
           last_log_index += 1
+          sources[msg['MID']] = msg['src']
+          msg['put_src'] = msg['src']
+          msg['src'] = my_id
+          msg['last_log_index'] = last_log_index - 1
           msg['term'] = current_term
           msg['success'] = [my_id]
           msg['committed'] = False
           msg['last_term'] = last_log_term
+          msg['index'] = last_log_index
           log[last_log_index] = msg
-          for rid in replica_ids:
-            if next_index[rid] == last_log_index:
-              append_msg = {'src': my_id, 'dst': rid, 'leader': leaderID, 'type': 'AppendEntries',
-                            'MID': msg['MID'], 'term': current_term, 'index': last_log_index,
-                            'key': msg['key'], 'value': msg['value'],
-                            'last_log_index': last_log_index - 1, 'last_log_term': last_log_term}
-              last_sent_to_followers[rid] = time.time()
-              sock_send(append_msg)
           last_log_term = current_term
-          #database[msg['key']] = msg['value']
-          #ok_msg = {"src": my_id, "dst": msg['src'], "leader": leaderID, "type": "ok", "MID": msg['MID']}
-          #sock_send(ok_msg)
         else:
-          ok_msg = {"src": my_id, "dst": msg['src'], "leader": leaderID,
-                    "type": "ok", "MID": msg['MID'], "value": database[msg['key']]}
-          sock_send(ok_msg)
+          try:
+            ok_msg = {"src": my_id, "dst": msg['src'], "leader": leaderID,
+                      "type": "ok", "MID": msg['MID'], "value": database[msg['key']]}
+            sock_send(ok_msg)
+          except KeyError:
+            redir_msg = {'src': my_id, 'dst': msg['src'], 'leader': leaderID,
+                         'type': 'redirect', 'MID': msg['MID']}
+            sock_send(redir_msg)
 
     # someone requested a vote
     elif msg['type'] == 'RequestVote':
+      new_msg = {}
+
       # this is from a previous term; decline
       if msg['term'] < current_term:
         new_msg = {'src': my_id, 'dst': msg['src'], 'leader': leaderID, 'type': 'ResponseVote',
                    'voteGranted': False, 'term': current_term}
 
       # either this is for a higher term, or for this term and i already voted for this server
-      elif msg['term'] > current_term or (voted_for == msg['src'] and msg['term'] == current_term):
+      elif (msg['term'] > current_term or (voted_for == msg['src'] and msg['term'] == current_term)) and msg['last_log_index'] >= last_log_index:
         current_term = msg['term']
         voted_for = msg['src']
         leaderID = 'FFFF'
+        if status == 'leader':
+          election_timeout = random.randrange(100, 200) / float(1000)
         last_received_from_leader = time.time()
+        status = 'follower'
         new_msg = {'src': my_id, 'dst': msg['src'], 'leader': leaderID, 'type': 'ResponseVote',
                    'voteGranted': True, 'term': current_term}
 
-      # in this election, i already voted for someone else
+      # new term, but the log wasn't updated enough
+      elif msg['term'] > current_term:
+        current_term = msg['term']
+        voted_for = ''
+        leaderID = 'FFFF'
+        if status == 'leader':
+          last_received_from_leader = time.time()
+          election_timeout = random.randrange(100, 200) / float(1000)
+        status = 'follower'
+        new_msg = {'src': my_id, 'dst': msg['src'], 'leader': leaderID, 'type': 'ResponseVote',
+                   'voteGranted': False, 'term': current_term}
+
       else:
         new_msg = {'src': my_id, 'dst': msg['src'], 'leader': leaderID, 'type': 'ResponseVote',
                    'voteGranted': False, 'term': current_term}
+
       sock_send(new_msg)
 
     # candidate use; someone responded to my vote request
@@ -171,42 +191,10 @@ while True:
         for rid in replica_ids:
           next_index[rid] = last_log_index + 1
           match_index[rid] = 0
-          new_msg = {'src': my_id, 'dst': rid, 'leader': leaderID,
-                     'type': 'Leader', 'term': current_term, 'last_log_index': last_log_index}
+          append_msg = {'src': my_id, 'dst': rid, 'leader': leaderID, 'type': 'AppendEntries',
+                        'term': current_term, 'entries': [], 'commit_index': commit_index}
           last_sent_to_followers[rid] = time.time()
-          sock_send(new_msg)
-
-    # leader update received
-    elif msg['type'] == 'Leader':
-      if msg['term'] >= current_term:
-        # this is from a new leader, reset election timeout
-        if leaderID == 'FFFF':
-          election_timeout = random.randrange(100, 200) / float(1000)
-
-        # reset the following values
-        last_received_from_leader = time.time()
-        votes_granted = {}
-        voted_for = ''
-        leaderID = msg['leader']
-        status = 'follower'
-        current_term = msg['term']
-
-        # send a response to the leader
-        new_msg = {'src': my_id, 'dst': leaderID, 'type': 'LeaderResponse',
-                   'term': current_term, 'match_index': last_log_index}
-
-    elif msg['type'] == 'LeaderResponse':
-      if msg['term'] == current_term:
-        rid = msg['src']
-        leader_responses[rid] = True
-        match_index[rid] = msg['match_index']
-        if match_index[rid] != last_log_index:
-          next_index[rid] = match_index[rid] + 1
-          repl_msg = {'src': my_id, 'dst': rid, 'leader': leaderID, 'type': 'AppendEntries',
-                      'MID': log[next_index[rid]]['MID'], 'term': current_term,
-                      'key': log[next_index[rid]]['key'], 'value': log[next_index[rid]]['value'],
-                      'last_log_index': next_index[rid] - 1, 'last_log_term': log[next_index[rid]]['term']}
-          sock_send(repl_msg)
+          sock_send(append_msg)
 
     elif msg['type'] == 'AppendEntries':
       # i must have missed an election -> update
@@ -219,109 +207,115 @@ while True:
 
       # this is the correct term
       elif msg['term'] == current_term:
-        # first message, add to log
-        if last_log_index == 0:
-          log[msg['index']] = msg
-          last_log_index = msg['index']
+        # this is from a new leader, reset election timeout
+        if leaderID == 'FFFF':
+          election_timeout = random.randrange(100, 200) / float(1000)
+        # reset the following values
+          last_received_from_leader = time.time()
+          votes_granted = {}
+          leaderID = msg['leader']
+          status = 'follower'
+          current_term = msg['term']
+
+        # catch up on commits
+        lead_commit = msg['commit_index']
+        if lead_commit > commit_index:
+          #print my_id, last_applied, commit_index, lead_commit, len(log)
+          last_applied = commit_index
+          commit_index = min(lead_commit, len(log))
+          for idx in range(last_applied + 1, commit_index + 1):
+            database[log[idx]['key']] = log[idx]['value']
+
+        # there is an entry
+        if len(msg['entries']) == 1:
+          entry = msg['entries'][0]
+          # first message, add to log
+          if last_log_index == 0 or entry['last_log_index'] == 0:
+            log[entry['index']] = entry
+            last_log_index = entry['index']
+            last_log_term = current_term
+            new_msg = {'src': my_id, 'dst': leaderID, 'type': 'AppendResponse', 'leader': leaderID,
+                       'term': current_term, 'success': True, 'match_index': commit_index,
+                       'last_log_index': last_log_index, 'index': entry['index']}
+            sock_send(new_msg)
+            continue
+
+          last_msg = {}
+          try:
+            last_msg = log[entry['last_log_index']]
+
+          # i don't have the previous log entry, tell leader where i'm at in the log
+          except KeyError:
+            new_msg = {'src': my_id, 'dst': leaderID, 'type': 'AppendResponse', 'leader': leaderID,
+                       'term': current_term, 'success': False, 'match_index': commit_index}
+            sock_send(new_msg)
+            continue
+
+          # i have the previous log entry but for the wrong term, tell leader where i'm at
+          if last_msg['term'] != entry['last_term']:
+            new_msg = {'src': my_id, 'dst': leaderID, 'type': 'AppendResponse', 'leader': leaderID,
+                       'term': current_term, 'success': False, 'match_index': commit_index,
+                       'last_log_index': last_log_index}
+            sock_send(new_msg)
+            continue
+          other_msg = {}
+
+          # i already have an entry for the new message
+          try:
+            other_msg = log[entry['index']]
+
+            # old entry is bad, delete and all that follow it
+            if other_msg['MID'] != entry['MID']:
+              ind = entry['index']
+              try:
+                while log[ind]:
+                  del log[ind]
+                  ind += 1
+              except KeyError:
+                pass
+          except KeyError:
+            pass
+
+          # i am free to add to the log, whether there never was a duplicate or i deleted it
+          log[entry['index']] = entry
+          last_log_index = entry['index']
           last_log_term = current_term
           new_msg = {'src': my_id, 'dst': leaderID, 'type': 'AppendResponse', 'leader': leaderID,
                      'term': current_term, 'success': True, 'match_index': commit_index,
-                     'last_log_index': last_log_index, 'index': msg['index']}
+                     'last_log_index': last_log_index, 'index': entry['index']}
           sock_send(new_msg)
-          continue
-
-        last_msg = {}
-        try:
-          last_msg = log[msg['last_log_index']]
-
-        # i don't have the previous log entry, tell leader where i'm at in the log
-        except KeyError:
-          new_msg = {'src': my_id, 'dst': leaderID, 'type': 'AppendResponse', 'leader': leaderID,
-                     'term': current_term, 'success': False, 'match_index': commit_index}
-          sock_send(new_msg)
-          continue
-
-        # i have the previous log entry but for the wrong term, tell leader where i'm at
-        if last_msg['term'] != msg['last_log_term']:
-          new_msg = {'src': my_id, 'dst': leaderID, 'type': 'AppendResponse', 'leader': leaderID,
-                     'term': current_term, 'success': False, 'match_index': commit_index,
-                     'last_log_index': last_log_index}
-          sock_send(new_msg)
-          continue
-        other_msg = {}
-
-        # i already have an entry for the new message
-        try:
-          other_msg = log[msg['index']]
-
-          # old entry is bad, delete and all that follow it
-          if other_msg['MID'] != msg['MID']:
-            ind = msg['index']
-            try:
-              while log[ind]:
-                del log[ind]
-                ind += 1
-            except KeyError:
-              pass
-        except KeyError:
-          pass
-
-        # i am free to add to the log, whether there never was a duplicate or i deleted it
-        log[msg['index']] = msg
-        last_log_index = msg['index']
-        last_log_term = current_term
-        new_msg = {'src': my_id, 'dst': leaderID, 'type': 'AppendResponse', 'leader': leaderID,
-                   'term': current_term, 'success': True, 'match_index': commit_index,
-                   'last_log_index': last_log_index, 'index': msg['index']}
-        sock_send(new_msg)
 
     elif msg['type'] == 'AppendResponse':
       if msg['term'] == current_term:
         if msg['success']:
           rid = msg['src']
-          next_index[rid] += 1
-          #print next_index, rid, last_log_index
-          # follower is still behind, catch up
-          if next_index[rid] != last_log_index + 1:
-            append_msg = {'src': my_id, 'dst': rid, 'leader': leaderID, 'type': 'AppendEntries',
-                          'MID': log[next_index[rid]]['MID'], 'term': log[next_index[rid]]['term'],
-                          'index': next_index[rid],
-                          'key': log[next_index[rid]]['key'], 'value': log[next_index[rid]]['value'],
-                          'last_log_index': next_index[rid] - 1, 'last_log_term': log[next_index[rid]]['last_term']}
-            sock_send(append_msg)
-          # this message is already committed, tell the follower to commit
-          if log[msg['index']]['committed']:
-            commit_msg = {'src': my_id, 'dst': rid, 'type': 'commit', 'leader': leaderID, 'index': msg['index']}
-            sock_send(commit_msg)
-          log[msg['index']]['success'].append(rid)
+          if next_index[rid] == msg['index']:
+            next_index[rid] += 1
+          if rid not in log[msg['index']]['success']:
+            log[msg['index']]['success'].append(rid)
           if len(log[msg['index']]['success']) >= (num_servers / 2) + 1 and not log[msg['index']]['committed']:
             # commit message
             log[msg['index']]['committed'] = True
-            commit_index = msg['index']
+            commit_index += 1
             database[log[msg['index']]['key']] = log[msg['index']]['value']
-            ok_msg = {'src': my_id, 'dst': log[msg['index']]['src'], 'type': 'ok',
-                      'leader': leaderID, 'MID': log[msg['index']]['MID']}
+            mid = log[msg['index']]['MID']
+            ok_msg = {'src': my_id, 'dst': log[msg['index']]['put_src'], 'type': 'ok',
+                      'leader': leaderID, 'MID': mid}
             sock_send(ok_msg)
-            for rid in replica_ids:
-              if rid in log[msg['index']]['success']:
-                commit_msg = {'src': my_id, 'dst': rid, 'type': 'commit', 'leader': leaderID, 'index': msg['index']}
-                sock_send(commit_msg)
         # append failure, correct follower
         else:
           rid = msg['src']
-          next_index[rid] -= 1
+          try:
+            if next_index[rid] != 1:
+              next_index[rid] -= 1
+          except KeyError:
+            next_index[rid] = last_log_index
+          #print next_index[rid]
+          #print log
           append_msg = {'src': my_id, 'dst': rid, 'leader': leaderID, 'type': 'AppendEntries',
-                        'MID': log[next_index[rid]]['MID'], 'term': log[next_index[rid]]['term'],
-                        'index': log[next_index[rid]]['index'],
-                        'key': log[next_index[rid]]['key'], 'value': log[next_index[rid]]['value'],
-                        'last_log_index': next_index[rid] - 1, 'last_log_term': log[next_index[rid]]['last_term']}
+                        'term': log[next_index[rid]]['term'],
+                        'entries': [log[next_index[rid]]], 'commit_index': commit_index}
           sock_send(append_msg)
-
-    elif msg['type'] == 'commit':
-      commit_index += 1
-      database[log[msg['index']]['key']] = log[msg['index']]['value']
-
-    #print my_id, num_messages
 
   # it's been too long since i've heard from the leader; initiate election
   if status != 'leader' and time.time() - last_received_from_leader >= election_timeout:
@@ -330,277 +324,13 @@ while True:
   # time to send a heartbeat message to my followers
   if status == 'leader':
     for rid in replica_ids:
-      if time.time() - last_sent_to_followers[rid] >= .1:
-        last_sent_to_followers[rid] = time.time()
-        new_msg = {'src': my_id, 'dst': rid, 'leader': leaderID,
-                   'type': 'Heartbeat', 'term': current_term}
-        sock_send(new_msg)
-
-#import sys
-#import socket
-#import select
-#import json
-#import random
-#import time
-
-# Your ID number
-#my_id = sys.argv[1]
-
-# The ID numbers of all the other replicas
-#replica_ids = sys.argv[2:]
-
-# Connect to the network. All messages to/from other replicas and clients will
-# occur over this socket
-#sock = socket.socket(socket.AF_UNIX, socket.SOCK_SEQPACKET)
-#sock.connect(my_id)
-
-#highest_committed_index = 0
-#index = 1
-#term = 0
-#leader = 'FFFF'
-#state = 'follower'
-#database = {}
-#voted = False
-#votes = 0
-#num_servers = len(replica_ids) + 1
-#backlog = {}
-#history = {}
-#nexts = {}
-#num_commits = 0
-#num_appendentries = 0
-#num_appendentries_back = 0
-#num_appendfailures = 0
-#num_requestvote = 0
-#num_vote = 0
-#num_leader = 0
-#num_heartbeat = 0
-#num_appendfailures_back = 0
-#last_heartbeat = ''
-#lasttime = 0
-#first = False
-#has_been_leader = True
-
-
-# initiate leader election
-#def initiate_election():
-#	global state
-#	global sock
-#	global term
-#	global voted
-#	global votes
-#	global leader
-#	global num_requestvote
-
-# print my_id, 'is initiating election'
-#	term += 1
-#	leader = 'FFFF'
-#	state = 'candidate'
-#	voted = True
-#	votes += 1
-#	for rid in replica_ids:
-#		vote_msg = {'src': my_id, 'dst': rid, 'leader': leader, 'type': 'RequestVote', 'term': term}
-#		num_requestvote += 1
-#		sock.send(json.dumps(vote_msg))
-
-
-# commit entries in the backlog until this index
-#def commit_till(index):
-#	global highest_committed_index
-
-#	while index > highest_committed_index:
-#		highest_committed_index += 1
-#		do_this = backlog[highest_committed_index]
-#		database[do_this['key']] = do_this['value']
-#
-#
-# send message to sock
-#def sock_send(msg):
-#if msg['type'] != 'vote' and msg['type'] != 'leader':
-#	print my_id, '(', time.time(), ') :', msg
-#if msg['type'] == 'redirect':
-#	print my_id, '(', time.time(), ') :', msg
-#	sock.send(json.dumps(msg))
-
-
-#election_timeout = random.randrange(100, 200) / float(1000)
-
-#while True:
-#	ready = select.select([sock], [], [], election_timeout)[0]
-
-#	if sock in ready:
-#		msg_raw = sock.recv(32768)
-#
-#		if len(msg_raw) == 0:
-#			continue
-
-#		msg = json.loads(msg_raw)
-
-#		# For now, ignore get() and put() from clients
-#		if msg['type'] in ['get', 'put']:
-#			if state != 'leader':
-#				new_msg = {'src': my_id, 'dst': msg['src'], 'leader': leader, 'type': 'redirect', 'MID': msg['MID']}
-#				sock_send(new_msg)
-#			else:
-#				has_been_leader = True
-#				#print my_id, '(', time.time(), ') :', msg
-#				if msg['type'] == 'put':
-#					#add_to_log = {'key': msg['key'], 'value': msg['value'], 'MID': msg['MID'], 'term': term,
-#							'src': msg['src'], 'confirms': 1, 'confirmed': False, 'index': index}
-#backlog[index] = add_to_log
-#					index += 1
-#					database[msg['key']] = msg['value']
-#					ok_msg = {'src': my_id, 'dst': msg['src'], 'type': 'ok', 'leader': leader, 'MID': msg['MID']}
-#					sock_send(ok_msg)
-#					for rid in replica_ids:
-#						replicas_msg = {'src': my_id, 'dst': rid, 'leader': leader, 'type': 'heartbeat', 'MID': msg['MID'],
-#														'term': term, 'highest_committed_index': highest_committed_index}
-
-#replicas_msg = {'key': msg['key'], 'value': msg['value'], 'MID': msg['MID'], 'term': term,
-#								'src': my_id, 'dst': rid, 'leader': leader, 'type': 'AppendEntries',
-#								'index': index - 1, 'highest_committed_index': highest_committed_index}
-#						num_appendentries += 1
-#						sock_send(replicas_msg)
-#				else:
-#if last_heartbeat != '':
-#	print time.time() - last_heartbeat
-#					for rid in replica_ids:
-#						replicas_msg = {'src': my_id, 'dst': rid, 'leader': leader, 'type': 'heartbeat', 'MID': msg['MID'],
-#																						'term': term, 'highest_committed_index': highest_committed_index}
-#						num_heartbeat += 1
-#						last_heartbeat = time.time()
-#						sock_send(replicas_msg)
-#print database
-#					try:
-#						new_msg = {'src': my_id, 'dst': msg['src'], 'leader': leader, 'type': 'ok', 'MID': msg['MID'],
-#																	'value': database[msg['key']]}
-#						sock_send(new_msg)
-#					except KeyError:
-#						print 'DATABASE:', database, '\nMSG:', msg
-#						sys.exit(0)
-
-#		elif msg['type'] == 'RequestVote':
-#			if msg['term'] > term:
-#				term = msg['term']
-#				voted = True
-#				leader = 'FFFF'
-#				new_msg = {'src': my_id, 'dst': msg['src'], 'leader': leader, 'type': 'vote', 'granted': True, 'term': term}
-#			else:
-#				new_msg = {'src': my_id, 'dst': msg['src'], 'leader': leader, 'type': 'vote', 'granted': False, 'term': term}
-#			num_vote += 1
-#			sock_send(new_msg)
-
-#		elif msg['type'] == 'vote':
-#			if msg['term'] == term and msg['granted'] and state != 'leader':
-#				votes += 1
-#				if votes >= (num_servers / 2) + 1:
-#					election_timeout = None
-#					# print my_id, ': i am now the leader!'
-#					leader = my_id
-#					votes = 0
-#					first = False
-#					state = 'leader'
-#					lasttime = time.time()
-#					for rid in replica_ids:
-#						nexts[rid] = index
-#					for rid in replica_ids:
-#						new_msg = {'src': my_id, 'dst': rid, 'leader': leader, 'type': 'leader', 'term': term}
-#						num_leader += 1
-#						sock_send(new_msg)
-
-
-#		elif msg['type'] == 'leader':
-#			# print my_id, ':', msg['leader'], 'is now the leader'
-#			election_timeout = random.randrange(100, 200) / float(1000)
-#			state = 'follower'
-#			voted = False
-#			votes = 0
-#			term = msg['term']
-#			leader = msg['leader']
-#			if has_been_leader:
-#				data_msg = {'src': my_id, 'dst': leader, 'type': 'data', 'leader': leader, 'data': database}
-
-#		elif msg['type'] == 'data' and state == 'leader':
-#			#print database
-#			database.update(msg['data'])
-#			#print database
-#
-#print my_id, '; num_request_vote', num_requestvote, '; num_append_entries', num_appendentries, \
-#	'; num_append_entries_back', num_appendentries_back, ';num_append_failures', num_appendfailures, \
-#	'; num_append_failures_back', num_appendfailures_back, '; num_commits', num_commits,\
-#	'; num_leader', num_leader, '; num_vote', num_vote, '; num_heartbeat', num_heartbeat
-
-#elif msg['type'] == 'AppendEntries' and state != 'leader':
-#	if msg['highest_committed_index'] > highest_committed_index:
-#		commit_till(msg['highest_committed_index'])
-#	if msg['term'] == term and index == msg['index']:
-#		backlog[msg['index']] = {'key': msg['key'], 'value': msg['value'], 'MID': msg['MID'], 'term': term, 'src': msg['src'], 'index': msg['index'], 'confirmed': False}
-#		index += 1
-#		new_msg = {'src': my_id, 'dst': msg['src'], 'leader': leader, 'type': 'AppendEntries', 'MID': msg['MID'], 'term': term, 'index': msg['index']}
-#		num_appendentries_back += 1
-#		sock_send(new_msg)
-#	elif msg['term'] == term:
-#		try:
-#			b = backlog[msg['index']]
-#			index += 1
-#			new_msg = {'src': my_id, 'dst': msg['src'], 'leader': leader, 'type': 'AppendEntries', 'MID': msg['MID'],
-#								 'term': term, 'index': index - 1}
-#			num_appendentries_back += 1
-#			sock_send(new_msg)
-#		except KeyError:
-#			index = msg['index']
-#			backlog[msg['index']] = {'key': msg['key'], 'value': msg['value'], 'MID': msg['MID'], 'term': term, 'src': msg['src']}
-#			new_msg = {'src': my_id, 'dst': msg['src'], 'leader': leader, 'type': 'AppendFailure'}
-#			num_appendfailures += 1
-#			sock_send(new_msg)
-
-#elif msg['type'] == 'AppendEntries' and state == 'leader':
-#	if msg['term'] == term:
-#		nexts[msg['src']] += 1
-#		log_entry = backlog[msg['index']]
-#		if not log_entry['confirmed']:
-#			log_entry['confirms'] += 1
-#			if log_entry['confirms'] >= (num_servers / 2) + 1:
-#				log_entry['confirmed'] = True
-#				database[log_entry['key']] = log_entry['value']
-#				ok_msg = {'src': my_id, 'dst': log_entry['src'], 'type': 'ok', 'leader': leader, 'MID': log_entry['MID']}
-#				sock_send(ok_msg)
-#				highest_committed_index += 1
-#				for rid in replica_ids:
-#					commit_msg = {'src': my_id, 'dst': rid, 'leader': leader, 'type': 'commit', 'MID': msg['MID'], 'index': log_entry['index'], 'term': term}
-#					num_commits += 1
-#					sock_send(commit_msg)
-
-#		elif msg['type'] == 'commit':
-#			if msg['term'] == term:
-#				try:
-#					log_entry = backlog[msg['index']]
-#					highest_committed_index = msg['index']
-#					database[log_entry['key']] = log_entry['value']
-#				except KeyError:
-#					pass
-#
-#		elif msg['type'] == 'AppendFailure':
-#			if msg['term'] == term:
-#				nexts[msg['src']] -= 1
-#				replicas_msg = backlog[index - 1]
-#				replicas_msg['src'] = my_id
-#				replicas_msg['dst'] = msg['src']
-#				replicas_msg['leader'] = leader
-#				replicas_msg['type'] = 'AppendEntries'
-#				replicas_msg['index'] = nexts[msg['src']]
-#				replicas_msg['highest_committed_index'] = highest_committed_index
-#				num_appendfailures_back += 1
-#				sock_send(replicas_msg)
-
-#	else:
-#		initiate_election()
-
-#clock = time.time()
-#print clock
-#if clock - last > 2:
-# Send a no-op message to a random peer every two seconds, just for fun
-# You definitely want to remove this from your implementation
-# msg = {'src': my_id, 'dst': random.choice(replica_ids), 'leader': 'FFFF', 'type': 'noop'}
-# sock.send(json.dumps(msg))
-# print '%s sending a NOOP to %s' % (msg['src'], msg['dst'])
-#last = clock
+      if time.time() - last_sent_to_followers[rid] >= .05:
+        # send heartbeat
+        if len(log) >= next_index[rid]:
+          append_msg = {'src': my_id, 'dst': rid, 'leader': leaderID, 'type': 'AppendEntries',
+                        'term': current_term, 'entries': [log[next_index[rid]]],
+                        'commit_index': commit_index}
+        else:
+          append_msg = {'src': my_id, 'dst': rid, 'leader': leaderID, 'type': 'AppendEntries',
+                        'term': current_term, 'entries': [], 'commit_index': commit_index}
+        sock_send(append_msg)
